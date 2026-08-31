@@ -1,0 +1,259 @@
+# Define your resource names
+ACR_NAME="mydemoquicktaskregistry"
+RESOURCE_GROUP="rg-acr-tasks-demo"
+LOCATION="centralus"
+
+# Create the Azure Resource Group
+az group create --name $RESOURCE_GROUP --location $LOCATION
+
+# Create the Azure Container Registry (Standard tier supports tasks)
+az acr create --resource-group $RESOURCE_GROUP --name $ACR_NAME --sku Standard --location $LOCATION
+
+# Create and move into a fresh demo directory
+mkdir acr-quicktask-demo && cd acr-quicktask-demo
+
+# Create an index file to display content
+echo "<h1>Hello from ACR Quick Tasks! Built on $(date)</h1>" > index.html
+
+# Generate a Dockerfile using an Nginx base image
+cat <<EOF > Dockerfile
+FROM nginx:alpine
+COPY index.html /usr/share/nginx/html/
+EXPOSE 80
+EOF
+
+# Execute the cloud-based build and tag the image
+az acr build --registry $ACR_NAME --image quicktask-demo:v1 .
+
+==================================================================
+
+# Trigger the ACR build using the remote GitHub repository as context
+az acr build \
+  --registry $ACR_NAME \
+  --image eshop-web:v1 \
+  --file src/Web/Dockerfile \
+  https://github.com/azurearchitect786/eShopOnWeb.git
+
+
+=====================================================================
+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
+
+GIT_REPO="https://github.com/azurearchitect786/eShopOnWeb.git#main"
+GIT_PAT="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"
+
+# Create the automated pipeline task
+az acr task create \
+  --registry $ACR_NAME \
+  --name eshop-web-trigger \
+  --image eshop-web:{{.Run.ID}} \
+  --context $GIT_REPO \
+  --file src/Web/Dockerfile \
+  --git-access-token "$GIT_PAT"
+
+# Manually test the new pipeline context stream - if required
+az acr task run --registry $ACR_NAME --name eshop-web-trigger
+
+# List recent tags generated for the eShopWeb image
+az acr repository show-tags --name $ACR_NAME --repository eshop-web --output table
+
+# ==== TEST DEPLOY =====
+az acr update -n mydemoquicktaskregistry --admin-enabled true
+
+# Re-set your tag identifier if needed (e.g. ca4)
+IMAGE_TAG="cj3"
+DNS_LABEL="eshop-web-demo-$(date +%s)"
+ACR_PASSWORD=$(az acr credential show --name $ACR_NAME --query "passwords[0].value" --output tsv)
+
+
+# Spin up the new instance bound to standard port 80
+az container create \
+  --resource-group rg-acr-tasks-demo \
+  --name eshop-web-testinstance \
+  --image "$ACR_NAME.azurecr.io/eshop-web:$IMAGE_TAG" \
+  --registry-login-server "$ACR_NAME.azurecr.io" \
+  --registry-username "$ACR_NAME" \
+  --registry-password "$ACR_PASSWORD" \
+  --dns-name-label $DNS_LABEL \
+  --ports 80 \
+  --environment-variables ASPNETCORE_HTTP_PORTS=80 \
+  --cpu 1 \
+  --memory 1.5 \
+  --os-type Linux
+
+
+# Retrieve the clean public domain string
+az container show \
+  --resource-group rg-acr-tasks-demo \
+  --name eshop-web-testinstance \
+  --query "ipAddress.fqdn" \
+  --output table
+
+
+# Create a task that triggers on BOTH Git pushes AND every 5 minutes
+az acr task create \
+  --registry $ACR_NAME \
+  --name eshop-dual-trigger-task \
+  --image prod/eshop-web:{{.Run.ID}} \
+  --context $GIT_REPO \
+  --file src/Web/Dockerfile \
+  --git-access-token "$GIT_PAT" \
+  --schedule "*/5 * * * *"
+
+# Manually test the new pipeline context stream
+az acr task run --registry $ACR_NAME --name eshop-dual-trigger-task
+
+
+# Create a task with explicit base image tracking enabled
+az acr task create \
+  --registry $ACR_NAME \
+  --name eshop-base-patcher \
+  --image eshop-web:patched-{{.Run.ID}} \
+  --context $GIT_REPO \
+  --file src/Web/Dockerfile \
+  --git-access-token "$GIT_PAT" \
+  --base-image-trigger-name "DailySecurityPatchTrigger" \
+  --base-image-trigger-type Runtime
+
+=====================================================================
+
+ACR_NAME="mydemotaggingregistry"
+RESOURCE_GROUP="rg-acr-tagging-demo"
+LOCATION="centralus"
+
+# Create the resource group and registry
+az group create --name $RESOURCE_GROUP --location $LOCATION
+az acr create --resource-group $RESOURCE_GROUP --name $ACR_NAME --sku Standard --location $LOCATION
+
+# Create and move into a fresh demo directory
+mkdir acr-stablevsunique-demo && cd acr-stablevsunique-demo
+
+# Create an index file to display content
+echo "<h1>Hello from ACR Quick Tasks! Built on $(date)</h1>" > index.html
+
+# Generate a Dockerfile using an Nginx base image
+cat <<EOF > Dockerfile
+FROM nginx:alpine
+COPY index.html /usr/share/nginx/html/
+EXPOSE 80
+EOF
+
+az acr build --registry $ACR_NAME --image tagging-demo:latest .
+
+
+# Create an index file to display content
+echo "<h1>Changed-Hello from ACR Quick Tasks! Built on $(date)</h1>" > index.html
+
+az acr build --registry $ACR_NAME --image tagging-demo:latest .
+
+# List unique image digests along with their associated tag arrays
+az acr manifest list-metadata \
+  --registry $ACR_NAME \
+  --name tagging-demo \
+  --query "[:].[digest, timestamp, tags]" \
+  --output table
+
+========================================================================
+
+GIT_REPO="https://github.com/azurearchitect786/eShopOnWeb.git#main"
+GIT_PAT="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"
+
+# Approach A: Build ID Tag ({{.Run.ID}})
+az acr task create \
+  --registry $ACR_NAME \
+  --name eshop-web-trigger \
+  --image eshop-web:{{.Run.ID}} \
+  --context $GIT_REPO \
+  --file src/Web/Dockerfile \
+  --git-access-token "$GIT_PAT"
+
+# Approach B: Semantic Versioning with Build Arguments (--build-arg)
+
+Passes explicit release versions down from your CI pipeline orchestrator (like GitHub Actions or Azure Pipelines) using custom task arguments.
+
+# Create a task that expects a version variable passed at runtime
+az acr task create --registry $ACR_NAME --name tag-by-semver \
+  --image "tagging-demo:{{.Values.VERSION}}" \
+  --context $GIT_REPO \
+  --file src/Web/Dockerfile \
+  --git-access-token "$GIT_PAT"
+  --set VERSION=1.0.0
+
+# Execute it manually by overwriting the default value to simulate a new release
+az acr task run --registry $ACR_NAME --name tag-by-semver --set VERSION=1.2.4
+
+# Approach C: Git Commit SHA Tag ({{.Values.ID}} or passed from Git)
+This explicitly tells the Azure build runner to inject the runtime Git checkout commit context directly into your image build command tags:
+
+
+acr-task.yml
+version: v1.1.0
+steps:
+  # Build using the native $Commit environment shortcut alias
+  - build: -t $Registry/eshop-web:$Commit -f src/Web/Dockerfile .
+  # Push the generated build artifact to your cloud registry
+  - push: ["$Registry/eshop-web:$Commit"]
+
+
+az acr task create \
+  --registry $ACR_NAME \
+  --name eshop-web-sha-trigger \
+  --context "https://github.com/azurearchitect786/eShopOnWeb.git#main" \
+  --file acr-task.yaml \
+  --git-access-token "$GIT_PAT"
+
+==========================================================================
+
+# Step A: List all orphaned manifests that have NO tags attached
+
+
+az acr manifest list-metadata \
+  --registry $ACR_NAME \
+  --name tagging-demo \
+  --query "[:].[digest, timestamp, tags]" \
+  --output table
+
+az acr manifest list-metadata \
+  --registry $ACR_NAME \
+  --name tagging-demo \
+  --query "[?tags==null].[digest]" \
+  --output table
+
+# Step B: Delete a specific orphaned image by passing its unique digest hash
+# Replace the example digest below with a real hash from Step A
+ORPHAN_DIGEST="sha256:b6d099a261e5ed784e76cd5a78cd9699f0045eac972d56b2a543a832ad3394d0"
+
+az acr repository delete \
+  --name $ACR_NAME \
+  --image "tagging-demo@$ORPHAN_DIGEST" \
+  --yes
+
+# Lock - Unlock deployed images
+az acr repository update --name $ACR_NAME --image tagging-demo:latest --write-enabled false
+
+az acr repository update --name $ACR_NAME --image tagging-demo:latest --write-enabled true
+
+
+# Auto-purge untagged images
+az acr run --registry $ACR_NAME \
+--cmd "acr purge --filter 'eshop-web:.*' --untagged --ago 7d" \
+/dev/null
+
+# Schedule automatic cleanup
+az acr task create \
+--registry $ACR_NAME \
+--name cleanup-untagged \
+--cmd "acr purge --filter '.*:.*' --untagged --ago 7d" \
+--schedule "0 0 * * 0" \
+--context /dev/null
+
+# Step A: Upgrade your container registry to the Premium tier
+az acr update --name $ACR_NAME --sku Premium
+
+# Step B: Enable the native retention policy and set a 30-day lifecycle limit
+az acr config retention update \
+  --registry $ACR_NAME \
+  --status enabled \
+  --days 30 \
+  --type UntaggedManifests
+
+====================================================================================
