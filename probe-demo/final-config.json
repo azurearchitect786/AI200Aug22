@@ -1,0 +1,64 @@
+{
+  "identity": {
+    "type": "UserAssigned",
+    "userAssignedIdentities": {
+      "/subscriptions/06cb8659-f29a-4c66-a432-03817fc40482/resourcegroups/rg-probe-demo-new/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-aca-probe-puller-new": {}
+    }
+  },
+  "properties": {
+    "configuration": {
+      "activeRevisionsMode": "Single",
+      "ingress": {
+        "external": true,
+        "targetPort": 5000,
+        "transport": "auto",
+        "allowInsecure": false
+      },
+      "registries": [
+        {
+          "server": "acrprobedemo1782580518.azurecr.io",
+          "identity": "/subscriptions/06cb8659-f29a-4c66-a432-03817fc40482/resourcegroups/rg-probe-demo-new/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-aca-probe-puller-new"
+        }
+      ]
+    },
+    "template": {
+      "containers": [
+        {
+          "name": "probe-demo-app",
+          "image": "acrprobedemo1782580518.azurecr.io/probe-demo:1.0.0",
+          "resources": {
+            "cpu": 0.5,
+            "memory": "1.0Gi"
+          },
+          "probes": [
+            {
+              "type": "Startup",
+              "httpGet": { "path": "/startup", "port": 5000 },
+              "initialDelaySeconds": 5,
+              "periodSeconds": 3,
+              "failureThreshold": 10
+            },
+            {
+              "type": "Liveness",
+              "httpGet": { "path": "/liveness", "port": 5000 },
+              "periodSeconds": 5,
+              "initialDelaySeconds": 2,
+              "failureThreshold": 2
+            },
+            {
+              "type": "Readiness",
+              "httpGet": { "path": "/readiness", "port": 5000 },
+              "periodSeconds": 3,
+              "timeoutSeconds": 2,
+              "failureThreshold": 2
+            }
+          ]
+        }
+      ],
+      "scale": {
+        "minReplicas": 1,
+        "maxReplicas": 1
+      }
+    }
+  }
+}

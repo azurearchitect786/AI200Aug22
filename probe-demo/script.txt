@@ -1,0 +1,127 @@
+export RG="rg-probe-demo"
+export LOCATION="eastus2"
+export ACR_NAME="acrprobedemo$(date +%s)" # Generates a unique global name
+export ACA_ENV_NAME="cae-probe-demo"
+export APP_NAME="probe-demo-app"
+export IDENTITY_NAME="id-aca-probe-puller"
+
+echo "Creating Resource Group..."
+az group create --name $RG --location $LOCATION
+
+
+# ==========================================
+# 1. PROVISION USER-ASSIGNED MANAGED IDENTITY
+# ==========================================
+echo "Creating User-Assigned Managed Identity..."
+az identity create --resource-group $RG --name $IDENTITY_NAME
+
+
+# Extract identity details for resource injection
+IDENTITY_ID=$(az identity show --resource-group $RG --name $IDENTITY_NAME --query id -o tsv)
+IDENTITY_CLIENT_ID=$(az identity show --resource-group $RG --name $IDENTITY_NAME --query principalId -o tsv)
+
+
+# ==========================================
+# 2. BUILD PRODUCTION PIPELINE (STANDARD ACR)
+# ==========================================
+echo "Creating Standard Azure Container Registry..."
+az acr create --resource-group $RG --name $ACR_NAME --sku Standard
+
+
+ACR_REGISTRY_ID=$(az acr show --name $ACR_NAME --query id -o tsv)
+
+echo "Granting AcrPull role to the Managed Identity..."
+az role assignment create \
+  --assignee $IDENTITY_CLIENT_ID \
+  --role "AcrPull" \
+  --scope $ACR_REGISTRY_ID
+
+
+echo "Building Flask Container Image natively inside ACR..."
+az acr build --registry $ACR_NAME --image probe-demo:1.0.0 ./probe-demo
+
+
+# ==========================================
+# 3. CONTAINER APP ENVIRONMENT CREATION
+# ==========================================
+echo "Creating Public Container App Environment..."
+az containerapp env create --name $ACA_ENV_NAME --resource-group $RG --location $LOCATION
+
+cd probe-demo
+
+
+# ==========================================
+# 4. CONFIGURATION INJECTION & APP DEPLOY
+# ==========================================
+echo "Injecting Registry and Managed Identity parameters into configuration template..."
+sed -e "s|IDENTITY_ID_PLACEHOLDER|$IDENTITY_ID|g" \
+    -e "s|ACR_NAME_PLACEHOLDER|$ACR_NAME|g" \
+    container-config.json > final-config.json
+
+
+echo "Deploying Secure Container App with Health Probes..."
+az containerapp create \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --environment $ACA_ENV_NAME \
+  --yaml final-config.json
+
+
+# Fetch the public web entry point link
+PUBLIC_URL=$(az containerapp show --name $APP_NAME --resource-group $RG --query "properties.configuration.ingress.fqdn" -o tsv)
+
+echo "====================================================="
+echo "DEMO READY! Access the application via your browser at:"
+echo "https://$PUBLIC_URL"
+echo "====================================================="
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ [ Container Starts ]
+          |
+          v
++--------------------+
+
+|   STARTUP PROBE    | <--- Retries until success threshold is hit
++--------------------+
+          |
+          v (Passes)
+          +--------------------------------------------+
+
+          | (Parallel Execution Loop)                  |
+          v                                            v
++--------------------+                       +--------------------+
+
+|  READINESS PROBE   |                       |   LIVENESS PROBE   |
++--------------------+                       +--------------------+
+
+          |                                            |
+     (If Fails)                                   (If Fails)
+          v                                            v
+[ Remove from Ingress ]                      [ Hard Docker Restart ]
+  * Stops receiving user traffic               * Restarts container process
+  * Remains alive for debugging                * Increments restart counter
+
+
+
