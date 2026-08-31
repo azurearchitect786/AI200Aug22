@@ -1,0 +1,142 @@
+# Variables
+RG="demo-appservice-identity-rg"
+LOC="centralus"
+ACR="acrdemo$RANDOM"
+PLAN="demo-linux-plan"
+APP="app-container-demo-$RANDOM"
+ID_NAME="id-appservice-acr-reader"
+
+az group create --name $RG --location $LOC
+az acr create --resource-group $RG --name $ACR --sku Basic --admin-enabled false
+
+az identity create --name $ID_NAME --resource-group $RESOURCE_GROUP --location $LOCATION
+
+
+ACR_ID=$(az acr show --name $ACR_NAME --query id --output tsv)
+PRINCIPAL_ID=$(az identity show --name $ID_NAME --resource-group $RESOURCE_GROUP --query principalId --output tsv)
+IDENTITY_RESOURCE_ID=$(az identity show --name $ID_NAME --resource-group $RESOURCE_GROUP --query id --output tsv)
+
+
+az role assignment create --assignee $PRINCIPAL_ID --scope $ACR_ID --role "AcrPull"
+
+cd app_demo
+
+az acr build --registry $ACR --image webdemo:v1 .
+
+az appservice plan create --name $PLAN --resource-group $RESOURCE_GROUP --sku P1v3 --is-linux
+
+az webapp create \
+  -g $RESOURCE_GROUP -p $PLAN -n $APP \
+  --container-image-name "ai200registry6346.azurecr.io/acrtask/chatapp@sha256:bd89ab95559742e724ae7af017386e79900874a3584d11627368dbab0f4802c0" \
+  --assign-identity $IDENTITY_RESOURCE_ID \
+  --acr-use-identity \
+  --acr-identity $IDENTITY_RESOURCE_ID
+
+az webapp config appsettings set --name $APP --resource-group $RG \
+  --settings WEBSITES_PORT=5000 AlwaysOn=true WEBSITES_CONTAINER_START_TIME_LIMIT=1800 APP_ENVIRONMENT="Production-Identity-Secure"
+
+az webapp config connection-string set --name $APP --resource-group $RG \
+  --connection-string-type Custom \
+  --settings DB_CONNECTION="Server=tcp:demo-secure.database.windows.net;Database=securedb;"
+
+STORAGE_ACCOUNT="storedemo$RANDOM"
+FILE_SHARE_NAME="appdata"
+
+
+az storage account create --name $STORAGE_ACCOUNT --resource-group $RESOURCE_GROUP --sku Standard_LRS --kind StorageV2 --location $LOCATION
+
+
+STORAGE_KEY=$(az storage account keys list --resource-group $RESOURCE_GROUP --account-name $STORAGE_ACCOUNT --query "[0].value" --output tsv)
+
+az storage share create --name $FILE_SHARE_NAME --account-name $STORAGE_ACCOUNT --account-key $STORAGE_KEY
+
+
+az webapp config storage-account add --resource-group $RESOURCE_GROUP --name $APP \
+  --custom-id "AppVolumeMount" \
+  --storage-type "AzureFiles" \
+  --account-name $STORAGE_ACCOUNT \
+  --share-name $FILE_SHARE_NAME \
+  --access-key $STORAGE_KEY \
+  --mount-path "/home/chat_history"
+
+
+
+az acr build --registry $ACR --image webdemo:v2 .
+
+az webapp config container set \
+  --name $APP \
+  --resource-group $RG \
+  --container-image-name "$ACR.azurecr.io/webdemo:v2"
+
+az webapp restart --name $APP --resource-group $RG
+
+
+az webapp update \
+  --name $APP \
+  --resource-group $RG \
+  --set siteConfig.healthCheckPath="/health"
+
+az acr build --registry $ACR --image webdemo:v4 .
+
+
+az webapp config container set \
+  --name $APP \
+  --resource-group $RG \
+  --container-image-name "$ACR.azurecr.io/webdemo:v4"
+
+az webapp config set --name $APP --resource-group $RG --startup-file ""
+
+curl -X POST "https://$APP.azurewebsites.net/predict" \
+     -H "Content-Type: application/json" \
+     -d '{"text": "Azure custom containers are fast!"}'
+
+
+az webapp log config --name $APP --resource-group $RG --web-server-logging filesystem
+
+# Stream container initialization and application logs in real-time
+az webapp log tail --name $APP --resource-group $RG
+
+az webapp config appsettings set --resource-group $RG --name $APP --settings WEBSITES_ENABLE_APP_SERVICE_STORAGE=true
+
+az webapp log config \
+    --resource-group $RG \
+    --name $APP \
+    --docker-container-logging filesystem
+
+WORKSPACE_NAME="myLogAnalyticsWorkspaceAI200"
+
+az monitor log-analytics workspace create \
+    --resource-group $RG \
+    --workspace-name $WORKSPACE_NAME \
+    --location centralus \
+    --sku PerGB2018
+
+resourceId=$(az webapp show -g $RG -n $APP --query id -o tsv)
+
+workspaceId=$(az monitor log-analytics workspace show -g $RG -n $WORKSPACE_NAME --query id -o tsv)
+
+az monitor diagnostic-settings create \
+    --resource "$resourceId" \
+    --name myDiagnosticSettings \
+    --workspace "$workspaceId" \
+    --logs '[{"category":"AppServiceConsoleLogs","enabled":true},{"category":"AppServiceHTTPLogs","enabled":true}]'
+
+AppServiceConsoleLogs
+| where Message contains "Model: MockLLM"
+| project TimeGenerated, Message
+| order by TimeGenerated desc
+| take 50
+
+AppServiceHTTPLogs
+| summarize Count=count() by ScStatus, CsUriStem, UserAgent
+| order by Count desc
+
+
+
+
+az webapp config container set \
+  --resource-group AI-200-RG \
+  --name app-container-demo-7750 \
+  --slot new \
+  --docker-custom-image-name "ai200registry6346.azurecr.io/chatapp-quicktask-demo:storage" \
+  --docker-registry-server-url "https://ai200registry6346.azurecr.io"
