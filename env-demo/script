@@ -1,0 +1,178 @@
+# ==========================================
+# RESOURCE DEFINITIONS & PARAMETERS
+# ==========================================
+export RG="rg-enterprise-ai-prod"
+export LOCATION="eastus2"
+export ACR_NAME="acraiprod$(date +%s)" # Unique global name
+export VNET_NAME="vnet-ai-core-prod"
+export SUBNET_NAME="snet-aca-compute"
+export ACA_ENV_NAME="cae-secure-ai-backend"
+export IDENTITY_NAME="id-aca-acr-puller"
+
+echo "Creating Resource Group..."
+az group create --name $RG --location $LOCATION
+
+# ==========================================
+# 1. PROVISION USER-ASSIGNED MANAGED IDENTITY
+# ==========================================
+echo "Creating User-Assigned Managed Identity..."
+az identity create --resource-group $RG --name $IDENTITY_NAME
+
+# Extract Managed Identity details
+IDENTITY_ID=$(az identity show --resource-group $RG --name $IDENTITY_NAME --query id -o tsv)
+echo $IDENTITY_ID
+IDENTITY_CLIENT_ID=$(az identity show --resource-group $RG --name $IDENTITY_NAME --query principalId -o tsv)
+echo $IDENTITY_CLIENT_ID
+
+# ==========================================
+# 2. BUILD PRODUCTION PIPELINE (STANDARD ACR)
+# ==========================================
+echo "Creating Standard Azure Container Registry..."
+az acr create --resource-group $RG --name $ACR_NAME --sku Standard
+
+
+ACR_REGISTRY_ID=$(az acr show --name $ACR_NAME --query id -o tsv)
+echo $ACR_REGISTRY_ID
+
+echo "Granting AcrPull role to the Managed Identity..."
+az role assignment create \
+  --assignee $IDENTITY_CLIENT_ID \
+  --role "AcrPull" \
+  --scope $ACR_REGISTRY_ID
+
+echo "Building images natively inside Azure Container Registry..."
+az acr build --registry $ACR_NAME --image ai-router:1.0.0 ./router
+
+az acr build --registry $ACR_NAME --image embedding-service:1.0.0 ./embedding
+
+# ==========================================
+# 3. NETWORKING BOUNDARY (VNET)
+# ==========================================
+echo "Setting up Virtual Network Infrastructure..."
+az network vnet create \
+  --resource-group $RG \
+  --name $VNET_NAME \
+  --address-prefixes 10.50.0.0/16 \
+  --subnet-name $SUBNET_NAME \
+  --subnet-prefixes 10.50.1.0/27
+
+SUBNET_ID=$(az network vnet subnet show --resource-group $RG --vnet-name $VNET_NAME --name $SUBNET_NAME --query id --output tsv)
+echo $SUBNET_ID
+
+az network vnet subnet update \
+  --resource-group $RG \
+  --vnet-name $VNET_NAME \
+  --name $SUBNET_NAME \
+  --delegations "Microsoft.App/environments"
+
+# ==========================================
+# 4. CONTAINER APP ENVIRONMENT CREATION
+# ==========================================
+echo "Provisioning Isolated Container App Environment..."
+az containerapp env create \
+  --name $ACA_ENV_NAME \
+  --resource-group $RG \
+  --location $LOCATION \
+  --infrastructure-subnet-resource-id $SUBNET_ID \
+  --internal-only true
+
+echo "Configuring Dedicated D4 Workload Profile..."
+az containerapp env workload-profile add \
+  --name $ACA_ENV_NAME \
+  --resource-group $RG \
+  --workload-profile-name "D4" \
+  --workload-profile-type "D4" \
+  --min-nodes 1 \
+  --max-nodes 2
+
+  # ==========================================
+# 5. DEPLOY INNER-LOOP CONTAINER APPS WITH MI
+# ==========================================
+echo "Deploying Embedding Service to D4 Dedicated Profile..."
+az containerapp create \
+  --name "embedding-service" \
+  --resource-group $RG \
+  --environment $ACA_ENV_NAME \
+  --workload-profile-name "D4" \
+  --image "$ACR_NAME.azurecr.io/embedding-service:1.0.0" \
+  --user-assigned $IDENTITY_ID \
+  --registry-server "$ACR_NAME.azurecr.io" \
+  --registry-identity $IDENTITY_ID \
+  --min-replica 1 \
+  --max-replica 3 \
+  --ingress "internal" \
+  --target-port 5000 \
+  --cpu "2.0" --memory "4.0Gi"
+
+
+
+echo "Deploying Semantic Router to Serverless Consumption Profile..."
+az containerapp create \
+  --name "ai-semantic-router" \
+  --resource-group $RG \
+  --environment $ACA_ENV_NAME \
+  --workload-profile-name "Consumption" \
+  --image "$ACR_NAME.azurecr.io/ai-router:1.0.0" \
+  --user-assigned $IDENTITY_ID \
+  --registry-server "$ACR_NAME.azurecr.io" \
+  --registry-identity $IDENTITY_ID \
+  --min-replica 1 \
+  --max-replica 3 \
+  --ingress "internal" \
+  --target-port 8000 \
+  --cpu "0.5" --memory "1.0Gi" \
+  --env-vars "EMBEDDING_SERVICE_URL=http://embedding-service"
+
+
+az containerapp exec \
+  --name "ai-semantic-router" \
+  --resource-group "rg-enterprise-ai-prod" \
+  --container "ai-semantic-router"
+
+az containerapp logs show \
+--name "ai-semantic-router" \
+--resource-group "rg-enterprise-ai-prod" \
+--type console \
+--follow
+
+
+python3 -c "
+import urllib.request, json
+req = urllib.request.Request(
+    'http://localhost:8000/orchestrate',
+    data=json.dumps({'query': 'What is our Q3 enterprise pipeline projection?'}).encode('utf-8'),
+    headers={'Content-Type': 'application/json'},
+    method='POST'
+)
+with urllib.request.urlopen(req) as res:
+    print(json.dumps(json.loads(res.read().decode('utf-8')), indent=2))
+"
+
+apt-get update && apt-get install -y curl
+
+curl -X POST http://localhost:8000/orchestrate \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is our Q3 enterprise pipeline projection?"}'
+
+
+az acr build --registry $ACR_NAME --image ai-router:1.1.0 ./router
+
+az acr build --registry $ACR_NAME --image embedding-service:2.0.0 ./embedding
+
+
+az containerapp secret set \
+  --name "embedding-service" \
+  --resource-group "rg-enterprise-ai-prod" \
+  --secrets embeddings-api-key="EnterpriseSuperSecretToken2026!"
+
+az containerapp update   --name "embedding-service"   --resource-group "rg-enterprise-ai-prod"   --set-env-vars "EMBEDDING_MODEL_VERSION=v2.0" "EMBEDDINGS_API_KEY=secretref:embeddings-api-key" --image $ACR_NAME.azurecr.io/embedding-service:2.0.0
+
+az containerapp update   --name "ai-semantic-router"   --resource-group "rg-enterprise-ai-prod"   --set-env-vars "LOG_LEVEL=info" "FEATURE_EMBEDDINGS=true" --image $ACR_NAME.azurecr.io/ai-router:1.1.0
+
+apt-get update && apt-get install -y curl
+
+curl -X POST http://localhost:8000/orchestrate \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is our Q3 enterprise pipeline projection?"}'
+
+az group delete --name $RG
