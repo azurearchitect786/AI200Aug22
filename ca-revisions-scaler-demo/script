@@ -1,0 +1,436 @@
+# 1. Setup environment variables
+RG="demo-aca-rg"
+LOC="eastus2"
+ENV_NAME="demo-aca-env"
+APP_NAME="demo-web-app"
+IMAGE="mcr.microsoft.com/k8se/quickstart:latest"
+
+# Define the new public web app image
+NEW_IMAGE="nginxdemos/hello:latest"
+
+
+# 2. Create a resource group
+az group create --name $RG --location $LOC
+
+# 3. Create the Container Apps Environment
+az containerapp env create --name $ENV_NAME --resource-group $RG --location $LOC
+
+# 4. Deploy the App with single-Revision mode and Replica settings
+az containerapp create \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --environment $ENV_NAME \
+  --image $IMAGE \
+  --target-port 80 \
+  --ingress external \
+  --min-replicas 2 \
+  --max-replicas 5
+
+# Update the app with the new container image
+az containerapp update \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --image $NEW_IMAGE
+
+az containerapp revision list --name $APP_NAME --resource-group $RG --output table
+
+az containerapp revision list \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --query "[?properties.active==\`true\`].{Name:name, TrafficWeight:properties.trafficWeight, Created:properties.createdTime}" \
+  --output table
+
+az containerapp replica list \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --revision demo-web-app--0000001 \
+  --output table
+
+
+# ===================================================================================
+
+NEW_APP_NAME="demo-web-app-multilple"
+
+az containerapp create \
+  --name $NEW_APP_NAME \
+  --resource-group $RG \
+  --environment $ENV_NAME \
+  --image $IMAGE \
+  --target-port 80 \
+  --ingress external \
+  --min-replicas 2 \
+  --max-replicas 5
+
+echo " Starting Zero-Downtime Blue-Green Deployment..."
+
+az containerapp revision set-mode \
+  --name $NEW_APP_NAME \
+  --resource-group $RG \
+  --mode multiple
+
+V1_REV=$(az containerapp revision list --name $NEW_APP_NAME --resource-group $RG \
+  --query "[?properties.active==\`true\`].name" --output tsv)
+echo $V1_REV
+
+# EXPLICITLY PIN TRAFFIC to this revision name
+# This breaks the "latest revision wins" link
+az containerapp ingress traffic set \
+  --name $NEW_APP_NAME \
+  --resource-group $RG \
+  --revision-weight "$V1_REV=100"
+
+echo "Identifying current active revision..."
+CURRENT_ACTIVE_REV=$(az containerapp show \
+  --name $NEW_APP_NAME \
+  --resource-group $RG \
+  --query "properties.configuration.ingress.traffic[?weight==\`100\`].revisionName" \
+  --output tsv)
+
+if [ -z "$CURRENT_ACTIVE_REV" ]; then
+    echo "Error: Could not find a revision with 100% traffic. Is traffic currently split?"
+fi
+echo "Current active production revision: $CURRENT_ACTIVE_REV"
+
+
+echo "Deploying new image ($NEW_IMAGE)..."
+az containerapp update \
+  --name $NEW_APP_NAME \
+  --resource-group $RG \
+  --image $NEW_IMAGE
+
+NEW_REV=$(az containerapp revision list \
+  --name $NEW_APP_NAME \
+  --resource-group $RG \
+  --query "sort_by([].{name:name, created:properties.createdTime}, &created)[-1].name" \
+  --output tsv)
+
+echo $NEW_REV
+
+
+# Fetch the unique, direct testing FQDN for this specific revision
+REV_FQDN=$(az containerapp revision show \
+  --name $NEW_APP_NAME \
+  --resource-group $RG \
+  --revision $NEW_REV \
+  --query "properties.fqdn" \
+  --output tsv)
+
+echo "New Revision Created: $NEW_REV"
+echo "Private Revision Test URL: https://$REV_FQDN"
+
+
+echo "Beginning automated health checks on the new revision..."
+MAX_ATTEMPTS=12
+ATTEMPT=1
+SUCCESS=false
+
+while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+    echo "Health Check Attempt $ATTEMPT/$MAX_ATTEMPTS..."
+    
+    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://$REV_FQDN" || echo "000")
+    
+    if [ "$HTTP_STATUS" -eq 200 ]; then
+        echo "Health check PASSED! Revision returned HTTP 200."
+        SUCCESS=true
+        break
+    else
+        echo "Health check failed with status: $HTTP_STATUS. Retrying in 10 seconds..."
+        sleep 10
+        ATTEMPT=$((ATTEMPT + 1))
+    fi
+done
+
+# If health checks fail, abort safely without modifying production traffic
+if [ "$SUCCESS" = false ]; then
+    echo "Error: New revision failed health checks. Aborting deployment."
+    echo "Deactivating failed revision..."
+    az containerapp revision deactivate --name $NEW_APP_NAME --resource-group $RG --revision $NEW_REV
+    exit 1
+fi
+
+echo "Executing atomic production swap..."
+echo "Shifting 100% traffic to $NEW_REV using ingress traffic command..."
+
+# Using the dedicated ingress traffic set command [1]
+az containerapp ingress traffic set \
+  --name $NEW_APP_NAME \
+  --resource-group $RG \
+  --revision-weight "$NEW_REV=100"
+
+echo "Deployment successfully swapped with ZERO downtime!"
+
+echo $CURRENT_ACTIVE_REV
+echo "Deactivating old revision ($CURRENT_ACTIVE_REV) to scale down to 0 replicas..."
+az containerapp revision deactivate \
+  --name $NEW_APP_NAME \
+  --resource-group $RG \
+  --revision $CURRENT_ACTIVE_REV
+
+==========================================================================================
+The underlying Envoy proxy routes traffic to the already-running 
+replicas of the new revision in less than a millisecond. 
+There are no dropped connections, no cold starts, and no server restarts.
+
+==========================================================================================
+
+
+# Now let us see canary release pattern
+
+# ==========================================
+# 1. ENVIRONMENT VARIABLES
+# ==========================================
+RG="canary-demo-rg"
+LOC="eastus2"
+ENV_NAME="canary-env"
+APP_NAME="canary-web-app"
+
+# App versions (using lightweight public web apps)
+BASE_IMAGE="mcr.microsoft.com/k8se/quickstart:latest"
+CANARY_IMAGE="nginxdemos/hello:latest"
+
+az group create --name $RG --location $LOC
+az containerapp env create --name $ENV_NAME --resource-group $RG --location $LOC
+
+echo "Deploying base version (Production V1)..."
+az containerapp create \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --environment $ENV_NAME \
+  --image $BASE_IMAGE \
+  --target-port 80 \
+  --ingress external \
+  --revisions-mode multiple \
+  --min-replicas 2 \
+  --max-replicas 5
+
+V1_REV=$(az containerapp revision list --name $APP_NAME --resource-group $RG \
+  --query "[?properties.active==\`true\`].name" --output tsv)
+echo $V1_REV
+
+# EXPLICITLY PIN TRAFFIC to this revision name
+# This breaks the "latest revision wins" link
+az containerapp ingress traffic set \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --revision-weight "$V1_REV=100"
+
+echo "Production V1 is live on revision: $V1_REV"
+echo "----------------------------------------------------------------"
+
+
+echo "Phase 2: Starting Canary Release Pattern for V2..."
+echo "Injecting Canary image ($CANARY_IMAGE)..."
+az containerapp update \
+--name $APP_NAME \
+--resource-group $RG \
+--image $CANARY_IMAGE
+
+V2_CANARY_REV=$(az containerapp revision list --name $APP_NAME --resource-group $RG \
+  --query "sort_by([].{name:name, created:properties.createdTime}, &created)[-1].name" --output tsv)
+echo $V2_CANARY_REV
+
+CANARY_FQDN=$(az containerapp revision show --name $APP_NAME --resource-group $RG \
+  --revision $V2_CANARY_REV --query "properties.fqdn" --output tsv)
+
+
+echo "Canary Revision created: $V2_CANARY_REV"
+echo "Dedicated Canary internal test URL: https://$CANARY_FQDN"
+
+# 5. Route 10% Traffic to the Canary
+echo "Routing 10% of public production traffic to the Canary..."
+az containerapp ingress traffic set --name $APP_NAME --resource-group $RG \
+  --revision-weight "$V1_REV=90" "$V2_CANARY_REV=10"
+
+# 6. Monitor Canary Health under live traffic
+echo "Monitoring Canary health at 10% exposure..."
+MAX_CHECKS=10
+for i in $(seq 1 $MAX_CHECKS); do
+    echo "Canary live traffic verification check $i/$MAX_CHECKS..."
+    STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://$CANARY_FQDN" || echo "000")
+    if [ "$STATUS" -eq 200 ]; then
+        echo "Check passed (HTTP 200)"
+        sleep 5
+    else
+        echo "Canary failed with status $STATUS! Initiating rollback..."
+        az containerapp ingress traffic set --name $APP_NAME --resource-group $RG --revision-weight "$V1_REV=100"
+        az containerapp revision deactivate --name $APP_NAME --resource-group $RG --revision $V2_CANARY_REV
+        exit 1
+    fi
+done
+
+echo "Canary stable. Increasing traffic share to 50%..."
+az containerapp ingress traffic set --name $APP_NAME --resource-group $RG \
+  --revision-weight "$V1_REV=50" "$V2_CANARY_REV=50"
+
+# 8. Complete Full Promotion to 100% Traffic
+echo "Canary completely successful! Promoting V2 to 100% production..."
+az containerapp ingress traffic set --name $APP_NAME --resource-group $RG \
+  --revision-weight "$V2_CANARY_REV=100"
+
+# 9. Clean up V1 (Scale down to 0 replicas)
+echo "Deactivating V1 revision ($V1_REV) to eliminate idle infrastructure costs..."
+az containerapp revision deactivate --name $APP_NAME --resource-group $RG --revision $V1_REV
+
+echo "Canary rollout completed with zero downtime!"
+
+=============================================================================================
+
+#HTTP SCALER
+
+APP_NAME="http-scale-app-demo"
+
+az containerapp create \
+  --name http-scale-app \
+  --resource-group $RG \
+  --environment $ENV_NAME \
+  --image $IMAGE \
+  --target-port 80 \
+  --ingress external \
+  --min-replicas 1 \
+  --max-replicas 5 \
+  --scale-rule-name "http-load-rule" \
+  --scale-rule-type "http" \
+  --scale-rule-metadata "concurrentRequests=5"
+
+echo "Creating Container App with baseline defaults..."
+az containerapp create \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --environment $ENV_NAME \
+  --image $IMAGE \
+  --target-port 80 \
+  --ingress external \
+  --min-replicas 1 \
+  --max-replicas 5
+
+echo "Injecting the HTTP scale rule into the container app..."
+az containerapp update \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --scale-rule-name "http-load-rule" \
+  --scale-rule-type "http" \
+  --scale-rule-metadata "concurrentRequests=5"
+
+APP_URL=$(az containerapp show \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --query "properties.configuration.ingress.fqdn" --output tsv)
+
+echo "Target URL: https://$APP_URL"
+
+echo "Simulating high concurrent traffic load..."
+for i in {1..500}; do
+   curl -s -o /dev/null "https://$APP_URL" &
+done
+
+==========================================================================================
+
+# Run this in a second terminal to monitor scaling live (loops every 3 seconds)
+RG="canary-demo-rg"
+APP_NAME="http-scale-app-demo"
+
+while true; do 
+  clear; 
+  echo "Current Active Replicas at $(date +%H:%M:%S):"; 
+  az containerapp replica list \
+    --name $APP_NAME \
+    --resource-group $RG \
+    --output table; 
+  sleep 3; 
+done
+===========================================================================================
+
+#CPU scaler
+
+WORKLOAD_IMAGE="beekman9527/webapp:latest"
+APP_NAME="cpu-ram-scaler-app"
+
+echo "Updating application to use public workload-simulation image..."
+az containerapp create \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --image $WORKLOAD_IMAGE \
+  --environment $ENV_NAME \
+  --target-port 8080 \
+  --ingress external \
+  --min-replicas 1 \
+  --max-replicas 5
+
+
+echo "Injecting advanced CPU scale rule with required metadata..."
+az containerapp update \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --scale-rule-name "cpu-high-load-rule" \
+  --scale-rule-type "cpu" \
+  --scale-rule-metadata "type=Utilization" "value=1"
+
+# Run this in a second terminal to monitor scaling live (loops every 3 seconds)
+RG="canary-demo-rg"
+APP_NAME="cpu-ram-scaler-app"
+
+while true; do 
+  clear; 
+  echo "Current Active Replicas at $(date +%H:%M:%S):"; 
+  az containerapp replica list \
+    --name $APP_NAME \
+    --resource-group $RG \
+    --output table; 
+  sleep 3; 
+done
+------------------------------------------------------------------------------------------
+APP_URL=$(az containerapp show \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --query "properties.configuration.ingress.fqdn" --output tsv)
+
+echo "Target URL: https://$APP_URL"
+
+echo "Bombarding workload endpoint to force high CPU load..."
+for i in {1..500}; do
+   curl -s -o /dev/null "https://$APP_URL/workload.php?value=15000" &
+done
+
+============================================================================================
+
+echo "Injecting advanced Memory scale rule..."
+az containerapp update \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --scale-rule-name "memory-high-load-rule" \
+  --scale-rule-type "memory" \
+  --scale-rule-metadata "type=Utilization" "value=10"
+
+echo "Bombarding workload endpoint to force high CPU load..."
+for i in {1..500}; do
+   curl -s -o /dev/null "https://$APP_URL/workload.php?value=15000" &
+done
+
+============================================================================================
+
+echo "Injecting advanced Cron scale rule using Indian Time Zone (IST)..."
+az containerapp update \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --scale-rule-name "cron-ist-peak-hours-rule" \
+  --scale-rule-type "cron" \
+  --scale-rule-metadata \
+    "start=0 9 * * 1-5" \
+    "end=0 18 * * 1-5" \
+    "timezone=Asia/Kolkata" \
+    "desiredReplicas=3"
+
+echo "Injecting weekend Cron scale rule using Indian Time Zone (IST)..."
+az containerapp update \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --scale-rule-name "cron-ist-weekend-rule" \
+  --scale-rule-type "cron" \
+  --scale-rule-metadata \
+    "start=0 10 * * 6,0" \
+    "end=0 22 * * 6,0" \
+    "timezone=Asia/Kolkata" \
+    "desiredReplicas=3"
+
+
+=============================================================================================
