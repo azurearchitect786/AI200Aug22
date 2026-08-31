@@ -1,0 +1,98 @@
+RG="ingress-demo-rg"
+LOC="eastus2"
+ENV_NAME="ingress-demo-env"
+
+az group create --name $RG --location $LOC
+az containerapp env create --name $ENV_NAME --resource-group $RG --location $LOC
+
+HTTP_APP="http-affinity-app"
+
+az containerapp create \
+  --name $HTTP_APP \
+  --resource-group $RG \
+  --environment $ENV_NAME \
+  --image "nginxdemos/hello:plain-text" \
+  --target-port 80 \
+  --ingress external \
+  --min-replicas 3 \
+  --max-replicas 3
+
+HTTP_URL=$(az containerapp show -n $HTTP_APP -g $RG --query "properties.configuration.ingress.fqdn" -o tsv)
+
+echo "HTTP Ingress URL: https://$HTTP_URL"
+
+echo "Activating Layer 7 Session Affinity..."
+az containerapp ingress sticky-sessions set \
+  --name $HTTP_APP \
+  --resource-group $RG \
+  --affinity sticky
+
+===========================================================================================
+
+RG="tcp-ingress-only-rg"
+LOC="eastus2"
+VNET_NAME="tcp-vnet"
+ENV_NAME="tcp-vnet-env"
+APP_NAME="tcp-redis-server"
+
+az group create --name $RG --location $LOC
+
+az network vnet create \
+  --resource-group $RG \
+  --name $VNET_NAME \
+  --location $LOC \
+  --address-prefix 10.0.0.0/16
+
+az network vnet subnet create \
+  --resource-group $RG \
+  --vnet-name $VNET_NAME \
+  --name "tcp-infra-subnet" \
+  --address-prefixes 10.0.0.0/23
+
+
+az network vnet subnet update \
+  --resource-group $RG \
+  --vnet-name $VNET_NAME \
+  --name "tcp-infra-subnet" \
+  --delegations "Microsoft.App/environments"
+
+INFRA_SUBNET_ID=$(az network vnet subnet show \
+  --resource-group $RG \
+  --vnet-name $VNET_NAME \
+  --name "tcp-infra-subnet" \
+  --query "id" -o tsv)
+
+echo "Creating VNet-secured Container App Environment..."
+az containerapp env create \
+  --name $ENV_NAME \
+  --resource-group $RG \
+  --location $LOC \
+  --infrastructure-subnet-resource-id $INFRA_SUBNET_ID
+
+echo "Deploying standalone TCP Application..."
+az containerapp create \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --environment $ENV_NAME \
+  --image "redis:alpine" \
+  --target-port 6379 \
+  --ingress external \
+  --transport tcp \
+  --min-replicas 2 \
+  --max-replicas 2
+
+TCP_FQDN=$(az containerapp show \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --query "properties.configuration.ingress.fqdn" -o tsv)
+
+echo "TCP App successfully live!"
+echo "Public Connection Endpoint: $TCP_FQDN:6379"
+
+
+$TcpFqdn = "tcp-redis-server.agreeablesmoke-9c295c40.eastus2.azurecontainerapps.io"
+Test-NetConnection -ComputerName $TcpFqdn -Port 6379
+=========================================================================================
+The connection is active. 
+Your VNet gateway is correctly accepting external traffic 
+and streaming it to your backend Redis replica pods [ContainerAppTcpRequiresVnet].
