@@ -1,0 +1,147 @@
+RG="identity-rec-app-rg"
+LOC="eastus"
+ACR_NAME="idrecregistry$RANDOM"
+APP_NAME="recommendation-web-app"
+ENV_NAME="recommendation-env"
+IDENTITY_NAME="aca-acr-pull-identity"
+
+az group create --name $RG --location $LOC
+
+az acr create --resource-group $RG --name $ACR_NAME --sku Basic --admin-enabled false
+
+cd troubleshoot_demo
+
+az acr build --registry $ACR_NAME --image "$APP_NAME:v1" .
+
+az identity create --resource-group $RG --name $IDENTITY_NAME
+
+IDENTITY_RESOURE_ID=$(az identity show --resource-group $RG --name $IDENTITY_NAME --query "id" -o tsv)
+IDENTITY_CLIENT_ID=$(az identity show --resource-group $RG --name $IDENTITY_NAME --query "principalId" -o tsv)
+
+
+ACR_RESOURCE_ID=$(az acr show --name $ACR_NAME --query "id" -o tsv)
+ACR_LOGIN_SERVER=$(az acr show --name $ACR_NAME --query "loginServer" -o tsv)
+
+echo "Assigning AcrPull role to User-Assigned Identity..."
+az role assignment create \
+  --assignee $IDENTITY_CLIENT_ID \
+  --role "AcrPull" \
+  --scope $ACR_RESOURCE_ID
+
+az containerapp env create --name $ENV_NAME --resource-group $RG --location $LOC
+
+echo "Launching Application securely via User-Assigned Identity..."
+az containerapp create \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --environment $ENV_NAME \
+  --image "$ACR_LOGIN_SERVER/$APP_NAME:v1" \
+  --target-port 5000 \
+  --ingress external \
+  --min-replicas 1 \
+  --max-replicas 3 \
+  --user-assigned $IDENTITY_RESOURE_ID \
+  --registry-server $ACR_LOGIN_SERVER \
+  --registry-identity $IDENTITY_RESOURE_ID
+
+APP_URL=$(az containerapp show --name $APP_NAME --resource-group $RG --query "properties.configuration.ingress.fqdn" -o tsv)
+echo "Your  application is live at: https://$APP_URL"
+
+# Build the updated v2 visual code layout inside ACR
+az acr build --registry $ACR_NAME --image "$APP_NAME:v2" .
+
+echo "Deploying v2 image variant onto Azure Container Apps..."
+az containerapp update \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --image "$ACR_LOGIN_SERVER/$APP_NAME:v2"
+
+APP_URL=$(az containerapp show --name $APP_NAME --resource-group $RG --query "properties.configuration.ingress.fqdn" -o tsv)
+echo "Your  application is live at: https://$APP_URL"
+
+==========================================================================================
+
+LOG_WS_NAME="aca-troubleshoot-logs"
+
+az monitor log-analytics workspace create \
+  --resource-group $RG \
+  --workspace-name $LOG_WS_NAME
+
+WS_ID=$(az monitor log-analytics workspace show --resource-group $RG --workspace-name $LOG_WS_NAME --query "customerId" -o tsv)
+WS_KEY=$(az monitor log-analytics workspace get-shared-keys --resource-group $RG --workspace-name $LOG_WS_NAME --query "primarySharedKey" -o tsv)
+
+
+# Update the environment logging topology using the correct explicit destination flag
+az containerapp env update \
+  --name $ENV_NAME \
+  --resource-group $RG \
+  --logs-destination log-analytics \
+  --logs-workspace-id $WS_ID \
+  --logs-workspace-key $WS_KEY
+
+
+az containerapp update \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --set-env-vars "PORT=INVALID_NOT_A_NUMBER"
+
+az containerapp logs show \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --follow
+
+az containerapp update \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --set-env-vars "PORT=5000"
+
+
+========================================================================================
+
+az containerapp ingress enable \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --type external \
+  --target-port 8888
+
+az containerapp ingress show \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --query "{CurrentTargetPort:targetPort, TransportProtocol:transport}"
+
+az containerapp ingress enable \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --type external \
+  --target-port 5000
+
+az monitor log-analytics query \
+  --workspace $WS_ID \
+  --analytics-query "
+    ContainerAppConsoleLogs_CL
+    | where TimeGenerated > ago(1h)
+    | where Log_s has 'ValueError' or Log_s has 'fail'
+    | project TimeGenerated, ContainerAppName_s, Log_s
+    | order by TimeGenerated desc
+  " --output table
+
+
+Start the Live Stream in your primary terminal window to track incoming traffic events as they happen:bash
+
+az containerapp logs show \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --follow
+
+az containerapp logs show \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --tail 30 
+  
+
+az containerapp logs show \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --tail 30 \
+  --type system
+
